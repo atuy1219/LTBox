@@ -54,7 +54,27 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: TB376 unit tests
-        run: cargo test --locked -p ltbox-patch tb376
+        id: tb376_tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo test --locked -p ltbox-patch tb376 -- --nocapture *>&1 |
+            Tee-Object -FilePath tb376-test.log
+          "exit_code=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload TB376 test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tb376-test-log-${{ github.sha }}
+          path: tb376-test.log
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Enforce TB376 test result
+        if: steps.tb376_tests.outputs.exit_code != '0'
+        shell: pwsh
+        run: exit 1
 
       - name: Build release CLI
         run: cargo build --locked --release -p ltbox-gui --example tb376-globalizer

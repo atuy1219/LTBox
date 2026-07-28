@@ -13,4 +13,6 @@ pub mod region;
 pub mod rollback;
 pub mod root_pipeline;
 pub mod skroot;
+pub mod tb376;
+pub mod tb376_flash;
 pub(crate) mod zip_util;

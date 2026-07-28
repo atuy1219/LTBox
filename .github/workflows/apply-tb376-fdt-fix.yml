@@ -1,0 +1,64 @@
+name: Apply TB376 FDT fix
+
+on:
+  push:
+    branches:
+      - agent/tb376fc-globalizer
+    paths:
+      - '.github/tb376-apply/**'
+      - '.github/workflows/apply-tb376-fdt-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/tb376fc-globalizer
+          fetch-depth: 0
+
+      - name: Install Rust components
+        shell: bash
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Reconstruct and apply patch
+        shell: bash
+        run: |
+          cat .github/tb376-apply/part-* | base64 --decode > /tmp/apply_tb376_patch.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/apply_tb376_patch.py')
+          text = path.read_text()
+          old = "once('patch_vendor_boot_product_region(', 'patch_vendor_boot_region_country(')"
+          new = "s = s.replace('patch_vendor_boot_product_region(', 'patch_vendor_boot_region_country(')"
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one rename helper line, found {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+          python3 /tmp/apply_tb376_patch.py
+
+      - name: Format and validate
+        shell: bash
+        run: |
+          cargo fmt --all
+          cargo test --locked -p ltbox-patch tb376
+          cargo clippy --locked -p ltbox-patch -p ltbox-gui --example tb376-globalizer -- -D warnings
+          cargo build --locked --release -p ltbox-gui --example tb376-globalizer
+
+      - name: Commit fix
+        shell: bash
+        run: |
+          rm -rf .github/tb376-apply .github/tb376-patch
+          rm -f .github/workflows/apply-tb376-fdt-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/ltbox-patch/src/tb376.rs .github
+          git commit -m "Fix TB376 vendor_boot FDT region parsing"
+          git push origin HEAD:agent/tb376fc-globalizer

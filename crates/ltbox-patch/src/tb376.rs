@@ -3,8 +3,8 @@
 //! This module never flashes a device. It validates one fixed profile and
 //! prepares two images for an officially bootloader-unlocked TB376FC:
 //!
-//! - `vendor_boot.img`: only the FDT `product_region` property is changed
-//!   from ROW to PRC.
+//! - `vendor_boot.img`: only the root FDT `region,country` properties for the
+//!   supported Tuna boards are changed from ROW to PRC.
 //! - `vbmeta.img`: AVB verification and hashtree-disable flags are enabled in
 //!   the same header field used by fastboot's disable-verification operation.
 //!
@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::avb;
-use crate::region::{self, RegionTarget};
+use crate::region::RegionTarget;
 
 pub const SOURCE_MODEL: &str = "TB376FC";
 pub const TARGET_MODEL: &str = "TB390FU";
@@ -54,6 +54,16 @@ const AVB_FLAGS_OFFSET: usize = 120;
 const AVB_MAGIC: &[u8; 4] = b"AVB0";
 const AVB_HASHTREE_DISABLED: u32 = 1;
 const AVB_VERIFICATION_DISABLED: u32 = 2;
+
+const FDT_MAGIC: u32 = 0xD00D_FEED;
+const FDT_MAGIC_BYTES: [u8; 4] = [0xD0, 0x0D, 0xFE, 0xED];
+const FDT_HEADER_SIZE: usize = 40;
+const FDT_BEGIN_NODE: u32 = 1;
+const FDT_END_NODE: u32 = 2;
+const FDT_PROP: u32 = 3;
+const FDT_NOP: u32 = 4;
+const FDT_END: u32 = 9;
+const EXPECTED_SUPPORTED_FDTS: usize = 3;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageAnalysis {
@@ -113,6 +123,29 @@ pub struct VbmetaFlagPatch {
     pub new_flags: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupportedBoard {
+    Tuna,
+    Tunap,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SupportedFdt {
+    board: SupportedBoard,
+    region: RegionTarget,
+    region_value_start: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FdtBounds {
+    base: usize,
+    total_end: usize,
+    struct_start: usize,
+    struct_end: usize,
+    strings_start: usize,
+    strings_end: usize,
+}
+
 pub fn analyze_tb390_firmware(firmware_dir: &Path) -> Result<FirmwareAnalysis> {
     if !firmware_dir.is_dir() {
         return Err(LtboxError::FileNotFound(firmware_dir.display().to_string()));
@@ -122,15 +155,11 @@ pub fn analyze_tb390_firmware(firmware_dir: &Path) -> Result<FirmwareAnalysis> {
     }
 
     let vendor_boot = firmware_dir.join("vendor_boot.img");
-    let detected_region = region::detect_product_region(&vendor_boot).ok_or_else(|| {
-        LtboxError::Patch(format!(
-            "{} has no readable product_region node",
-            vendor_boot.display()
-        ))
-    })?;
+    let vendor_boot_data = fs::read(&vendor_boot)?;
+    let (detected_region, _) = validate_supported_fdt_set(&vendor_boot_data)?;
     if detected_region != RegionTarget::Row {
         return Err(LtboxError::Patch(format!(
-            "TB390FU source firmware must be ROW, detected {detected_region:?}"
+            "TB390FU source firmware must have ROW root region,country values, detected {detected_region:?}"
         )));
     }
 
@@ -208,7 +237,7 @@ pub fn prepare_tb376_crossflash_images(
     fs::create_dir_all(output_dir)?;
 
     let vendor_boot_out = output_dir.join("vendor_boot.img");
-    let replacements = patch_vendor_boot_product_region(
+    let replacements = patch_vendor_boot_region_country(
         &firmware_dir.join("vendor_boot.img"),
         &vendor_boot_out,
         RegionTarget::Prc,
@@ -226,7 +255,7 @@ pub fn prepare_tb376_crossflash_images(
             "vendor_boot.img",
             &vendor_boot_out,
             format!(
-                "patched {replacements} product_region value(s) ROW -> PRC; the retained Lenovo AVB footer is stale after the payload edit"
+                "patched {replacements} supported root region,country value(s) ROW -> PRC; the retained Lenovo AVB footer is stale after the payload edit"
             ),
         )?,
         prepared_image(
@@ -265,18 +294,17 @@ pub fn prepare_tb376_crossflash_images(
     Ok(manifest)
 }
 
-/// Patch only `PRC`/`ROW` property values directly under the FDT
-/// `product_region` node. Unrelated strings elsewhere in vendor_boot are left
-/// untouched.
-pub fn patch_vendor_boot_product_region(
+/// Patch only the root `region,country` property in the three supported Tuna
+/// FDTs embedded in the fixed-profile TB390FU vendor_boot image. Unrelated ROW
+/// strings, including the AVB fingerprint, are left untouched.
+pub fn patch_vendor_boot_region_country(
     input: &Path,
     output: &Path,
     target: RegionTarget,
 ) -> Result<usize> {
     require_file(input)?;
-    let source = region::detect_product_region(input).ok_or_else(|| {
-        LtboxError::Patch(format!("no product_region node in {}", input.display()))
-    })?;
+    let original = fs::read(input)?;
+    let (source, fdts) = validate_supported_fdt_set(&original)?;
     if source == target {
         return Err(LtboxError::Patch(format!(
             "{} already reports region {target:?}",
@@ -284,53 +312,45 @@ pub fn patch_vendor_boot_product_region(
         )));
     }
 
-    let mut data = fs::read(input)?;
-    let node_name = b"product_region\0";
-    let source_bytes = region_bytes(source);
-    let target_bytes = region_bytes(target);
-    let mut cursor = 0usize;
-    let mut replacements = 0usize;
-
-    while let Some(relative) = find_subslice(&data[cursor..], node_name) {
-        let node_start = cursor + relative;
-        let mut pos = align4(node_start + node_name.len());
-        for _ in 0..32 {
-            if pos + 12 > data.len() || be32(&data[pos..pos + 4]) != 3 {
-                break;
-            }
-            let value_len = be32(&data[pos + 4..pos + 8]) as usize;
-            let value_start = pos + 12;
-            let value_end = value_start.checked_add(value_len).ok_or_else(|| {
-                LtboxError::Patch("product_region property length overflow".to_string())
-            })?;
-            if value_end > data.len() {
-                return Err(LtboxError::Patch(
-                    "truncated product_region property".to_string(),
-                ));
-            }
-
-            let nul = data[value_start..value_end]
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(value_len);
-            if nul == 3 && &data[value_start..value_start + 3] == source_bytes {
-                data[value_start..value_start + 3].copy_from_slice(target_bytes);
-                replacements += 1;
-            }
-            pos = align4(value_end);
+    let source_value = region_value(source);
+    let target_value = region_value(target);
+    let mut patched = original.clone();
+    for fdt in &fdts {
+        let value_end = fdt
+            .region_value_start
+            .checked_add(source_value.len())
+            .ok_or_else(|| LtboxError::Patch("region,country offset overflow".to_string()))?;
+        if patched.get(fdt.region_value_start..value_end) != Some(&source_value[..]) {
+            return Err(LtboxError::Patch(format!(
+                "supported FDT region,country changed before patch at offset 0x{:X}",
+                fdt.region_value_start
+            )));
         }
-        cursor = node_start + node_name.len();
+        patched[fdt.region_value_start..value_end].copy_from_slice(&target_value);
     }
 
-    if replacements == 0 {
+    let changed_bytes = original
+        .iter()
+        .zip(&patched)
+        .filter(|(before, after)| before != after)
+        .count();
+    if fdts.len() != EXPECTED_SUPPORTED_FDTS || changed_bytes != EXPECTED_SUPPORTED_FDTS * 3 {
         return Err(LtboxError::Patch(format!(
-            "no {source:?} product_region property was patched in {}",
-            input.display()
+            "unsafe vendor_boot region patch: {} replacements changed {changed_bytes} bytes",
+            fdts.len()
         )));
     }
-    fs::write(output, data)?;
+
+    let (verified_region, verified_fdts) = validate_supported_fdt_set(&patched)?;
+    if verified_region != target || verified_fdts.len() != EXPECTED_SUPPORTED_FDTS {
+        return Err(LtboxError::Patch(
+            "patched vendor_boot failed region,country verification".to_string(),
+        ));
+    }
+
+    fs::write(output, patched)?;
     ensure_same_size(input, output, "vendor_boot region patch")?;
-    Ok(replacements)
+    Ok(fdts.len())
 }
 
 pub fn patch_top_level_vbmeta_flags(
@@ -356,6 +376,250 @@ pub fn patch_top_level_vbmeta_flags(
         old_flags,
         new_flags,
     })
+}
+
+fn validate_supported_fdt_set(data: &[u8]) -> Result<(RegionTarget, Vec<SupportedFdt>)> {
+    let mut supported = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = find_subslice(&data[cursor..], &FDT_MAGIC_BYTES) {
+        let base = cursor + relative;
+        let Some(bounds) = parse_fdt_bounds(data, base) else {
+            cursor = base.saturating_add(FDT_MAGIC_BYTES.len());
+            continue;
+        };
+        if let Some(fdt) = parse_supported_fdt(data, bounds)? {
+            supported.push(fdt);
+        }
+        cursor = bounds.total_end;
+    }
+
+    if supported.len() != EXPECTED_SUPPORTED_FDTS {
+        return Err(LtboxError::Patch(format!(
+            "expected exactly {EXPECTED_SUPPORTED_FDTS} supported Tuna FDT region,country properties, found {}",
+            supported.len()
+        )));
+    }
+    let tuna_count = supported
+        .iter()
+        .filter(|fdt| fdt.board == SupportedBoard::Tuna)
+        .count();
+    let tunap_count = supported
+        .iter()
+        .filter(|fdt| fdt.board == SupportedBoard::Tunap)
+        .count();
+    if tuna_count != 2 || tunap_count != 1 {
+        return Err(LtboxError::Patch(format!(
+            "unexpected supported FDT board set: qcom,tuna={tuna_count}, qcom,tunap={tunap_count}"
+        )));
+    }
+    let region = supported[0].region;
+    if supported.iter().any(|fdt| fdt.region != region) {
+        return Err(LtboxError::Patch(
+            "supported FDT region,country values are mixed".to_string(),
+        ));
+    }
+    Ok((region, supported))
+}
+
+fn parse_fdt_bounds(data: &[u8], base: usize) -> Option<FdtBounds> {
+    let header_end = base.checked_add(FDT_HEADER_SIZE)?;
+    if header_end > data.len() || be32(data.get(base..base + 4)?) != FDT_MAGIC {
+        return None;
+    }
+    let total_size = usize::try_from(be32(data.get(base + 4..base + 8)?)).ok()?;
+    let struct_offset = usize::try_from(be32(data.get(base + 8..base + 12)?)).ok()?;
+    let strings_offset = usize::try_from(be32(data.get(base + 12..base + 16)?)).ok()?;
+    let strings_size = usize::try_from(be32(data.get(base + 32..base + 36)?)).ok()?;
+    let struct_size = usize::try_from(be32(data.get(base + 36..base + 40)?)).ok()?;
+    if total_size < FDT_HEADER_SIZE {
+        return None;
+    }
+    let total_end = base.checked_add(total_size)?;
+    let struct_start = base.checked_add(struct_offset)?;
+    let struct_end = struct_start.checked_add(struct_size)?;
+    let strings_start = base.checked_add(strings_offset)?;
+    let strings_end = strings_start.checked_add(strings_size)?;
+    if total_end > data.len()
+        || struct_start < header_end
+        || struct_end > total_end
+        || strings_start < header_end
+        || strings_end > total_end
+    {
+        return None;
+    }
+    Some(FdtBounds {
+        base,
+        total_end,
+        struct_start,
+        struct_end,
+        strings_start,
+        strings_end,
+    })
+}
+
+fn parse_supported_fdt(data: &[u8], bounds: FdtBounds) -> Result<Option<SupportedFdt>> {
+    let mut pos = bounds.struct_start;
+    let mut depth = 0usize;
+    let mut root_compatible = None;
+    let mut root_region = None;
+    let mut saw_root_compatible = false;
+    let mut saw_root_region = false;
+    let mut saw_end = false;
+    while pos + 4 <= bounds.struct_end {
+        let token = be32(&data[pos..pos + 4]);
+        pos += 4;
+        match token {
+            FDT_BEGIN_NODE => {
+                let name_end = find_nul(data, pos, bounds.struct_end).ok_or_else(|| {
+                    LtboxError::Patch(format!(
+                        "unterminated FDT node name at vendor_boot offset 0x{:X}",
+                        pos
+                    ))
+                })?;
+                pos = align4_checked(name_end + 1)
+                    .ok_or_else(|| LtboxError::Patch("FDT node alignment overflow".to_string()))?;
+                if pos > bounds.struct_end {
+                    return Err(LtboxError::Patch(
+                        "FDT node name exceeds structure block".to_string(),
+                    ));
+                }
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| LtboxError::Patch("FDT node depth overflow".to_string()))?;
+            }
+            FDT_END_NODE => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| LtboxError::Patch("unexpected FDT_END_NODE".to_string()))?;
+            }
+            FDT_PROP => {
+                if pos + 8 > bounds.struct_end {
+                    return Err(LtboxError::Patch(
+                        "truncated FDT property header".to_string(),
+                    ));
+                }
+                let value_len = usize::try_from(be32(&data[pos..pos + 4])).map_err(|_| {
+                    LtboxError::Patch("FDT property length conversion failed".to_string())
+                })?;
+                let name_offset = usize::try_from(be32(&data[pos + 4..pos + 8])).map_err(|_| {
+                    LtboxError::Patch("FDT property name offset conversion failed".to_string())
+                })?;
+                pos += 8;
+                let value_start = pos;
+                let value_end = value_start
+                    .checked_add(value_len)
+                    .ok_or_else(|| LtboxError::Patch("FDT property length overflow".to_string()))?;
+                if value_end > bounds.struct_end {
+                    return Err(LtboxError::Patch(
+                        "FDT property exceeds structure block".to_string(),
+                    ));
+                }
+                if depth == 1 {
+                    let name_start =
+                        bounds
+                            .strings_start
+                            .checked_add(name_offset)
+                            .ok_or_else(|| {
+                                LtboxError::Patch("FDT property name offset overflow".to_string())
+                            })?;
+                    if name_start >= bounds.strings_end {
+                        return Err(LtboxError::Patch(
+                            "FDT property name is outside strings block".to_string(),
+                        ));
+                    }
+                    let name_end =
+                        find_nul(data, name_start, bounds.strings_end).ok_or_else(|| {
+                            LtboxError::Patch("unterminated FDT property name".to_string())
+                        })?;
+                    let name = &data[name_start..name_end];
+                    let value = &data[value_start..value_end];
+                    if name == b"compatible" {
+                        if saw_root_compatible {
+                            return Err(LtboxError::Patch(
+                                "duplicate root compatible property in FDT".to_string(),
+                            ));
+                        }
+                        saw_root_compatible = true;
+                        root_compatible = supported_board(value)?;
+                    } else if name == b"region,country" {
+                        if saw_root_region {
+                            return Err(LtboxError::Patch(
+                                "duplicate root region,country property in FDT".to_string(),
+                            ));
+                        }
+                        saw_root_region = true;
+                        let region = match value {
+                            b"ROW\0" => RegionTarget::Row,
+                            b"PRC\0" => RegionTarget::Prc,
+                            _ => {
+                                return Err(LtboxError::Patch(format!(
+                                    "unsupported root region,country value in FDT at vendor_boot offset 0x{:X}",
+                                    bounds.base
+                                )));
+                            }
+                        };
+                        root_region = Some((region, value_start));
+                    }
+                }
+                pos = align4_checked(value_end).ok_or_else(|| {
+                    LtboxError::Patch("FDT property alignment overflow".to_string())
+                })?;
+                if pos > bounds.struct_end {
+                    return Err(LtboxError::Patch(
+                        "FDT property padding exceeds structure block".to_string(),
+                    ));
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => {
+                saw_end = true;
+                break;
+            }
+            other => {
+                return Err(LtboxError::Patch(format!(
+                    "unsupported FDT token 0x{other:08X} at vendor_boot offset 0x{:X}",
+                    pos - 4
+                )));
+            }
+        }
+    }
+    if !saw_end || depth != 0 {
+        return Err(LtboxError::Patch(format!(
+            "invalid FDT structure at vendor_boot offset 0x{:X}",
+            bounds.base
+        )));
+    }
+    match (root_compatible, root_region) {
+        (Some(board), Some((region, region_value_start))) => Ok(Some(SupportedFdt {
+            board,
+            region,
+            region_value_start,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn supported_board(value: &[u8]) -> Result<Option<SupportedBoard>> {
+    let mut tuna = false;
+    let mut tunap = false;
+    for item in value
+        .split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+    {
+        match item {
+            b"qcom,tuna" => tuna = true,
+            b"qcom,tunap" => tunap = true,
+            _ => {}
+        }
+    }
+    match (tuna, tunap) {
+        (true, false) => Ok(Some(SupportedBoard::Tuna)),
+        (false, true) => Ok(Some(SupportedBoard::Tunap)),
+        (false, false) => Ok(None),
+        (true, true) => Err(LtboxError::Patch(
+            "FDT compatible contains both qcom,tuna and qcom,tunap".to_string(),
+        )),
+    }
 }
 
 fn analyze_image(path: &Path, name: &str) -> Result<ImageAnalysis> {
@@ -417,19 +681,26 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn region_bytes(region: RegionTarget) -> &'static [u8; 3] {
+fn region_value(region: RegionTarget) -> [u8; 4] {
     match region {
-        RegionTarget::Prc => b"PRC",
-        RegionTarget::Row => b"ROW",
+        RegionTarget::Prc => *b"PRC\0",
+        RegionTarget::Row => *b"ROW\0",
     }
 }
 
-fn align4(value: usize) -> usize {
-    (value + 3) & !3
+fn align4_checked(value: usize) -> Option<usize> {
+    value.checked_add(3).map(|aligned| aligned & !3)
 }
 
 fn be32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn find_nul(data: &[u8], start: usize, end: usize) -> Option<usize> {
+    data.get(start..end)?
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|relative| start + relative)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -473,25 +744,142 @@ mod tests {
     }
 
     #[test]
-    fn product_region_patch_is_limited_to_node_properties() {
+    fn detects_fixed_row_fdt_set_with_unrelated_fdt() {
+        let data = build_vendor_boot(&[
+            ("qcom,other", None),
+            ("qcom,tuna", Some(RegionTarget::Row)),
+            ("qcom,tuna", Some(RegionTarget::Row)),
+            ("qcom,tunap", Some(RegionTarget::Row)),
+        ]);
+        let (region, fdts) = validate_supported_fdt_set(&data).unwrap();
+        assert_eq!(region, RegionTarget::Row);
+        assert_eq!(fdts.len(), 3);
+    }
+
+    #[test]
+    fn region_country_patch_changes_exactly_nine_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("vendor_boot.img");
         let output = tmp.path().join("vendor_boot-patched.img");
-        let mut data = b"unrelated.ROW\0product_region\0".to_vec();
-        while !data.len().is_multiple_of(4) {
-            data.push(0);
-        }
-        data.extend_from_slice(&3u32.to_be_bytes());
-        data.extend_from_slice(&4u32.to_be_bytes());
-        data.extend_from_slice(&0u32.to_be_bytes());
-        data.extend_from_slice(b"ROW\0");
-        data.extend_from_slice(&2u32.to_be_bytes());
+        let data = build_vendor_boot(&[
+            ("qcom,other", None),
+            ("qcom,tuna", Some(RegionTarget::Row)),
+            ("qcom,tuna", Some(RegionTarget::Row)),
+            ("qcom,tunap", Some(RegionTarget::Row)),
+        ]);
         fs::write(&input, &data).unwrap();
-
-        let count = patch_vendor_boot_product_region(&input, &output, RegionTarget::Prc).unwrap();
-        assert_eq!(count, 1);
+        let count = patch_vendor_boot_region_country(&input, &output, RegionTarget::Prc).unwrap();
+        assert_eq!(count, 3);
         let patched = fs::read(output).unwrap();
-        assert!(patched.windows(14).any(|w| w == b"unrelated.ROW\0"));
-        assert!(patched.windows(4).any(|w| w == b"PRC\0"));
+        assert_eq!(patched.len(), data.len());
+        assert_eq!(
+            data.iter()
+                .zip(&patched)
+                .filter(|(before, after)| before != after)
+                .count(),
+            9
+        );
+        assert!(
+            patched
+                .windows(b"fingerprint_ROW".len())
+                .any(|window| window == b"fingerprint_ROW")
+        );
+        let (region, fdts) = validate_supported_fdt_set(&patched).unwrap();
+        assert_eq!(region, RegionTarget::Prc);
+        assert_eq!(fdts.len(), 3);
+    }
+
+    #[test]
+    fn rejects_mixed_supported_regions() {
+        let data = build_vendor_boot(&[
+            ("qcom,tuna", Some(RegionTarget::Row)),
+            ("qcom,tuna", Some(RegionTarget::Prc)),
+            ("qcom,tunap", Some(RegionTarget::Row)),
+        ]);
+        assert!(validate_supported_fdt_set(&data).is_err());
+    }
+
+    #[test]
+    fn rejects_incorrect_supported_fdt_count() {
+        let data = build_vendor_boot(&[
+            ("qcom,tuna", Some(RegionTarget::Row)),
+            ("qcom,tunap", Some(RegionTarget::Row)),
+        ]);
+        assert!(validate_supported_fdt_set(&data).is_err());
+    }
+
+    #[test]
+    fn rejects_incorrect_supported_board_distribution() {
+        let data = build_vendor_boot(&[
+            ("qcom,tuna", Some(RegionTarget::Row)),
+            ("qcom,tunap", Some(RegionTarget::Row)),
+            ("qcom,tunap", Some(RegionTarget::Row)),
+        ]);
+        assert!(validate_supported_fdt_set(&data).is_err());
+    }
+
+    fn build_vendor_boot(specs: &[(&str, Option<RegionTarget>)]) -> Vec<u8> {
+        let mut data = b"prefix fingerprint_ROW\0 unrelated ROW\0".to_vec();
+        for (compatible, region) in specs {
+            data.extend_from_slice(&build_fdt(compatible, *region));
+        }
+        data.extend_from_slice(b"suffix_ROW\0");
+        data
+    }
+
+    fn build_fdt(compatible: &str, region: Option<RegionTarget>) -> Vec<u8> {
+        let strings = b"compatible\0region,country\0";
+        let region_name_offset = u32::try_from(b"compatible\0".len()).unwrap();
+        let mut structure = Vec::new();
+        push_u32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"\0");
+        pad4(&mut structure);
+        push_property(&mut structure, 0, format!("{compatible}\0").as_bytes());
+        if let Some(region) = region {
+            push_property(&mut structure, region_name_offset, &region_value(region));
+        }
+        push_u32(&mut structure, FDT_END_NODE);
+        push_u32(&mut structure, FDT_END);
+
+        let struct_offset = FDT_HEADER_SIZE + 16;
+        let strings_offset = struct_offset + structure.len();
+        let total_size = strings_offset + strings.len();
+        let mut fdt = Vec::with_capacity(total_size);
+        for value in [
+            FDT_MAGIC,
+            u32::try_from(total_size).unwrap(),
+            u32::try_from(struct_offset).unwrap(),
+            u32::try_from(strings_offset).unwrap(),
+            u32::try_from(FDT_HEADER_SIZE).unwrap(),
+            17,
+            16,
+            0,
+            u32::try_from(strings.len()).unwrap(),
+            u32::try_from(structure.len()).unwrap(),
+        ] {
+            push_u32(&mut fdt, value);
+        }
+        fdt.resize(struct_offset, 0);
+        fdt.extend_from_slice(&structure);
+        fdt.extend_from_slice(strings);
+        fdt
+    }
+
+    fn push_property(structure: &mut Vec<u8>, name_offset: u32, value: &[u8]) {
+        push_u32(structure, FDT_PROP);
+        push_u32(structure, u32::try_from(value.len()).unwrap());
+        push_u32(structure, name_offset);
+        structure.extend_from_slice(value);
+        pad4(structure);
+    }
+
+    fn push_u32(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn pad4(output: &mut Vec<u8>) {
+        while !output.len().is_multiple_of(4) {
+            output.push(0);
+        }
     }
 }

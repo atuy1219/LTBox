@@ -1,0 +1,285 @@
+name: TB376 Rollback Fix
+
+on:
+  push:
+    branches:
+      - agent/tb376fc-globalizer
+    paths:
+      - '.github/workflows/tb376-rollback-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/tb376fc-globalizer
+
+      - name: Apply rollback validation fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("crates/ltbox-gui/examples/tb376-globalizer.rs")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one match, found {count}: {old[:100]!r}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "const SAMPLE_VERIFY_SECTORS: u64 = 128;",
+              '''const SAMPLE_VERIFY_SECTORS: u64 = 128;
+          const SOURCE_BUILD_DISPLAY_ID: &str =
+              "TB376FC_CN_OPEN_USER_Q00012.1_A16_ZUXOS_2.0.10.321_ST_260618";
+          const KNOWN_SOURCE_ROLLBACK_INDICES: &[(u32, u64)] = &[
+              (0, 0),
+              (1, 1),
+              (2, 1_777_939_200),
+              (3, 1_777_939_200),
+          ];
+          const EXPECTED_TARGET_ROLLBACK_INDICES: &[(&str, u32, u64)] = &[
+              ("vbmeta.img", 0, 0),
+              ("recovery.img", 1, 1),
+              ("vbmeta_system.img", 2, 1_777_939_200),
+              ("boot.img", 3, 1_777_939_200),
+          ];''',
+          )
+
+          replace_once(
+              '''    Ok(PreflightReport {
+                  generated_at_unix: unix_now()?,
+                  serialno,
+                  product,
+                  modelname,
+                  hwboardid,
+                  unlocked,
+                  current_slot,
+                  rollback_indices: vars.rollback_indices.into_iter().collect(),
+                  raw_getvar_all: vars.raw_getvar_all,
+              })''',
+              '''    let raw_getvar_all = vars.raw_getvar_all;
+              let expected_build_line = format!("build.display.id:{SOURCE_BUILD_DISPLAY_ID}");
+              if !raw_getvar_all
+                  .lines()
+                  .any(|line| line.trim().eq_ignore_ascii_case(&expected_build_line))
+              {
+                  return Err(format!(
+                      "unsupported running build; expected Fastboot to report {expected_build_line}"
+                  ));
+              }
+
+              let mut rollback_indices: BTreeMap<u32, u64> =
+                  vars.rollback_indices.into_iter().collect();
+              for (location, source_index) in KNOWN_SOURCE_ROLLBACK_INDICES {
+                  rollback_indices
+                      .entry(*location)
+                      .and_modify(|reported| *reported = (*reported).max(*source_index))
+                      .or_insert(*source_index);
+              }
+
+              Ok(PreflightReport {
+                  generated_at_unix: unix_now()?,
+                  serialno,
+                  product,
+                  modelname,
+                  hwboardid,
+                  unlocked,
+                  current_slot,
+                  rollback_indices,
+                  raw_getvar_all,
+              })''',
+          )
+
+          old = '''fn validate_rollback_floors(
+              report: &PreflightReport,
+              analysis: &tb376::FirmwareAnalysis,
+          ) -> CliResult<()> {
+              for image in &analysis.images {
+                  let location = image.rollback_index_location;
+                  if let Some(floor) = report.rollback_indices.get(&location)
+                      && image.rollback_index < *floor
+                  {
+                      return Err(format!(
+                          "rollback refusal: {} index {} at location {} is below device floor {}",
+                          image.name, image.rollback_index, location, floor
+                      ));
+                  }
+              }
+              Ok(())
+          }
+          '''
+          new = '''fn validate_rollback_floors(
+              report: &PreflightReport,
+              analysis: &tb376::FirmwareAnalysis,
+          ) -> CliResult<()> {
+              for (name, location, expected_index) in EXPECTED_TARGET_ROLLBACK_INDICES {
+                  let image = analysis
+                      .images
+                      .iter()
+                      .find(|image| image.name.eq_ignore_ascii_case(name))
+                      .ok_or_else(|| format!("target analysis is missing {name}"))?;
+                  if image.rollback_index_location != 0 {
+                      return Err(format!(
+                          "{name} header rollback location is {}, expected 0; parent vbmeta assigns AVB location {location}",
+                          image.rollback_index_location
+                      ));
+                  }
+                  if image.rollback_index != *expected_index {
+                      return Err(format!(
+                          "unexpected target rollback index for {name}: {}; expected {} at AVB location {location}",
+                          image.rollback_index, expected_index
+                      ));
+                  }
+                  let floor = report
+                      .rollback_indices
+                      .get(location)
+                      .ok_or_else(|| format!("preflight is missing rollback location {location}"))?;
+                  if image.rollback_index < *floor {
+                      return Err(format!(
+                          "rollback refusal: {name} index {} at AVB location {location} is below conservative baseline {floor}",
+                          image.rollback_index
+                      ));
+                  }
+              }
+              Ok(())
+          }
+          '''
+          if old not in text:
+              raise SystemExit("validate_rollback_floors block not found")
+          text = text.replace(old, new, 1)
+
+          replace_once(
+              '''    if !matches!(
+                  report.current_slot.to_ascii_lowercase().as_str(),
+                  "a" | "_a"
+              ) {
+                  return Err("preflight current slot is not A".to_string());
+              }
+              Ok(())''',
+              '''    if !matches!(
+                  report.current_slot.to_ascii_lowercase().as_str(),
+                  "a" | "_a"
+              ) {
+                  return Err("preflight current slot is not A".to_string());
+              }
+              let expected_build_line = format!("build.display.id:{SOURCE_BUILD_DISPLAY_ID}");
+              if !report
+                  .raw_getvar_all
+                  .lines()
+                  .any(|line| line.trim().eq_ignore_ascii_case(&expected_build_line))
+              {
+                  return Err(format!(
+                      "preflight does not report the exact source build {SOURCE_BUILD_DISPLAY_ID}"
+                  ));
+              }
+              for (location, source_index) in KNOWN_SOURCE_ROLLBACK_INDICES {
+                  let baseline = report
+                      .rollback_indices
+                      .get(location)
+                      .ok_or_else(|| format!("preflight is missing rollback location {location}"))?;
+                  if baseline < source_index {
+                      return Err(format!(
+                          "preflight baseline {baseline} at location {location} is below running source index {source_index}"
+                      ));
+                  }
+              }
+              Ok(())''',
+          )
+
+          replace_once(
+              '"The super partition was not duplicated by this run because it is multi-gigabyte. Keep the existing full EDL backup before continuing.\\n",',
+              '"The super partition was not duplicated by this run because it is multi-gigabyte. Keep the exact matching CN recovery package together with the critical device-state backup.\\n",',
+          )
+          replace_once(
+              '"Slot B and all TB376FC low-level firmware were preserved.".to_string(),',
+              '"Slot B and all TB376FC low-level firmware were preserved, but shared super means slot B is not guaranteed bootable.".to_string(),',
+          )
+
+          path.write_text(text, encoding="utf-8")
+
+          tb376 = Path("crates/ltbox-patch/src/tb376.rs")
+          text = tb376.read_text(encoding="utf-8")
+          text = text.replace(
+              '"Offline analysis cannot read device rollback floors; compare boot and vbmeta_system indices before flashing.".to_string(),',
+              '"The fixed source build baseline covers AVB locations 0=vbmeta, 1=recovery, 2=vbmeta_system and 3=boot.".to_string(),',
+              1,
+          )
+          text = text.replace(
+              '"Flash support remains disabled until rollback floors and the full partition compatibility plan are verified on-device.".to_string(),',
+              '"The guarded flash path requires a fresh exact-build preflight and validates all four AVB rollback locations.".to_string(),',
+              1,
+          )
+          tb376.write_text(text, encoding="utf-8")
+
+          flash = Path("crates/ltbox-patch/src/tb376_flash.rs")
+          text = flash.read_text(encoding="utf-8")
+          text = text.replace(
+              '"Only slot A and unsuffixed Android OS partitions are written; slot B remains a recovery path.".to_string(),',
+              '"Only slot A and unsuffixed Android OS partitions are written; slot B is preserved, but shared super means it is not guaranteed bootable.".to_string(),',
+              1,
+          )
+          flash.write_text(text, encoding="utf-8")
+
+      - name: Install Rust components
+        shell: pwsh
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Format and test
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo test --locked -p ltbox-patch tb376
+          cargo build --locked --release -p ltbox-gui --example tb376-globalizer
+
+      - name: Commit fix
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/ltbox-gui/examples/tb376-globalizer.rs `
+                  crates/ltbox-patch/src/tb376.rs `
+                  crates/ltbox-patch/src/tb376_flash.rs
+          git diff --cached --check
+          git commit -m "Fix TB376 rollback validation"
+          git push origin HEAD:agent/tb376fc-globalizer
+
+      - name: Stage artifact
+        id: stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\examples\tb376-globalizer.exe dist\tb376-globalizer-win-x64.exe
+          $hash = (Get-FileHash dist\tb376-globalizer-win-x64.exe -Algorithm SHA256).Hash
+          "$hash  tb376-globalizer-win-x64.exe" | Set-Content -Encoding ascii dist\tb376-globalizer-win-x64.exe.sha256
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: tb376-globalizer-rollback-fixed-${{ github.sha }}
+          path: |
+            dist/tb376-globalizer-win-x64.exe
+            dist/tb376-globalizer-win-x64.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          @"
+          ## TB376 rollback fix
+
+          - Exact source build required: `TB376FC_CN_OPEN_USER_Q00012.1_A16_ZUXOS_2.0.10.321_ST_260618`
+          - AVB locations checked: 0 vbmeta, 1 recovery, 2 vbmeta_system, 3 boot
+          - SHA-256: `${{ steps.stage.outputs.sha256 }}`
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

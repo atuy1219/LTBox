@@ -6,6 +6,11 @@ on:
       - agent/tb376fc-globalizer
     paths:
       - '.github/workflows/tb376-rollback-fix.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/tb376-rollback-fix.yml'
 
 permissions:
   contents: write

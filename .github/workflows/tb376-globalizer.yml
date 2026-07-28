@@ -6,7 +6,6 @@ on:
       - agent/tb376fc-globalizer
     paths:
       - '.github/workflows/tb376-globalizer.yml'
-      - '.github/tb376-apply/**'
       - 'crates/ltbox-core/**'
       - 'crates/ltbox-device/**'
       - 'crates/ltbox-patch/**'
@@ -29,7 +28,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,50 +36,7 @@ env:
   CARGO_INCREMENTAL: '0'
 
 jobs:
-  apply-fdt-fix:
-    if: github.event_name == 'pull_request' && github.actor != 'github-actions[bot]'
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: agent/tb376fc-globalizer
-          fetch-depth: 0
-
-      - name: Reconstruct and apply validated patch
-        shell: pwsh
-        run: |
-          $encoded = (Get-ChildItem '.github\tb376-apply\part-*' |
-            Sort-Object Name |
-            ForEach-Object { (Get-Content $_.FullName -Raw).Trim() }) -join ''
-          $script = Join-Path $env:RUNNER_TEMP 'apply_tb376_patch.py'
-          [IO.File]::WriteAllBytes($script, [Convert]::FromBase64String($encoded))
-          @'
-          from pathlib import Path
-          path = Path(r'__SCRIPT_PATH__')
-          text = path.read_text()
-          old = "once('patch_vendor_boot_product_region(', 'patch_vendor_boot_region_country(')"
-          new = "s = s.replace('patch_vendor_boot_product_region(', 'patch_vendor_boot_region_country(')"
-          if text.count(old) != 1:
-              raise SystemExit(f'expected one rename helper line, found {text.count(old)}')
-          path.write_text(text.replace(old, new))
-          '@.Replace('__SCRIPT_PATH__', $script.Replace('\', '\\')) | python -
-          python $script
-          cargo fmt --all
-
-      - name: Commit validated code
-        shell: pwsh
-        run: |
-          git rm -r .github/tb376-apply .github/tb376-patch
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add crates/ltbox-patch/src/tb376.rs
-          git diff --cached --stat
-          git commit -m "Fix TB376 vendor_boot FDT region parsing"
-          git push origin HEAD:agent/tb376fc-globalizer
-
   build-windows-x64:
-    if: github.event_name == 'workflow_dispatch' || github.actor == 'github-actions[bot]'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:

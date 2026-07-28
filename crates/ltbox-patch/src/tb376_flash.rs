@@ -264,7 +264,7 @@ pub fn build_flash_plan(firmware_dir: &Path, prepared_dir: &Path) -> Result<Flas
         warnings: vec![
             "The plan deliberately preserves TB376FC ABL/XBL and all Qualcomm firmware partitions.".to_string(),
             "Patch XML and GPT writes are deliberately excluded; device GPT geometry is validated at runtime.".to_string(),
-            "Only slot A and unsuffixed Android OS partitions are written; slot B remains a recovery path.".to_string(),
+            "Only slot A and unsuffixed Android OS partitions are written; slot B is preserved, but shared super means it is not guaranteed bootable.".to_string(),
             "metadata and userdata are erased after the OS images are written; FRP is preserved.".to_string(),
             "Never relock after this cross-flash.".to_string(),
         ],

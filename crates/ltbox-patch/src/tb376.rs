@@ -194,7 +194,7 @@ pub fn analyze_tb390_firmware(firmware_dir: &Path) -> Result<FirmwareAnalysis> {
     }
 
     let mut warnings = vec![
-        "Offline analysis cannot read device rollback floors; compare boot and vbmeta_system indices before flashing.".to_string(),
+        "The fixed source build baseline covers AVB locations 0=vbmeta, 1=recovery, 2=vbmeta_system and 3=boot.".to_string(),
         "Only use this profile on an officially unlocked TB376FC reporting product=malbec and hwboardid=SM8735P_8+128_22.".to_string(),
         "Keep hardware country and device-specific partitions unchanged.".to_string(),
     ];
@@ -279,7 +279,7 @@ pub fn prepare_tb376_crossflash_images(
         warnings: vec![
             "PREPARATION ONLY: no device was flashed.".to_string(),
             "Both images require an unlocked bootloader; never relock after installing them.".to_string(),
-            "Flash support remains disabled until rollback floors and the full partition compatibility plan are verified on-device.".to_string(),
+            "The guarded flash path requires a fresh exact-build preflight and validates all four AVB rollback locations.".to_string(),
         ],
     };
 

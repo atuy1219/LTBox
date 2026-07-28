@@ -13,6 +13,16 @@ type CliResult<T> = Result<T, String>;
 
 const PREFLIGHT_MAX_AGE_SECONDS: u64 = 6 * 60 * 60;
 const SAMPLE_VERIFY_SECTORS: u64 = 128;
+const SOURCE_BUILD_DISPLAY_ID: &str =
+    "TB376FC_CN_OPEN_USER_Q00012.1_A16_ZUXOS_2.0.10.321_ST_260618";
+const KNOWN_SOURCE_ROLLBACK_INDICES: &[(u32, u64)] =
+    &[(0, 0), (1, 1), (2, 1_777_939_200), (3, 1_777_939_200)];
+const EXPECTED_TARGET_ROLLBACK_INDICES: &[(&str, u32, u64)] = &[
+    ("vbmeta.img", 0, 0),
+    ("recovery.img", 1, 1),
+    ("vbmeta_system.img", 2, 1_777_939_200),
+    ("boot.img", 3, 1_777_939_200),
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PreflightReport {
@@ -188,6 +198,25 @@ fn fastboot_preflight() -> CliResult<PreflightReport> {
         return Err(format!("unexpected serial number: {serialno}"));
     }
 
+    let raw_getvar_all = vars.raw_getvar_all;
+    let expected_build_line = format!("build.display.id:{SOURCE_BUILD_DISPLAY_ID}");
+    if !raw_getvar_all
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(&expected_build_line))
+    {
+        return Err(format!(
+            "unsupported running build; expected Fastboot to report {expected_build_line}"
+        ));
+    }
+
+    let mut rollback_indices: BTreeMap<u32, u64> = vars.rollback_indices.into_iter().collect();
+    for (location, source_index) in KNOWN_SOURCE_ROLLBACK_INDICES {
+        rollback_indices
+            .entry(*location)
+            .and_modify(|reported| *reported = (*reported).max(*source_index))
+            .or_insert(*source_index);
+    }
+
     Ok(PreflightReport {
         generated_at_unix: unix_now()?,
         serialno,
@@ -196,8 +225,8 @@ fn fastboot_preflight() -> CliResult<PreflightReport> {
         hwboardid,
         unlocked,
         current_slot,
-        rollback_indices: vars.rollback_indices.into_iter().collect(),
-        raw_getvar_all: vars.raw_getvar_all,
+        rollback_indices,
+        raw_getvar_all,
     })
 }
 
@@ -291,7 +320,7 @@ fn flash_device_inner(
     write_json(&session_dir.join("backup-manifest.json"), &backup_records)?;
     std::fs::write(
         session_dir.join("SUPER_NOT_BACKED_UP.txt"),
-        "The super partition was not duplicated by this run because it is multi-gigabyte. Keep the existing full EDL backup before continuing.\n",
+        "The super partition was not duplicated by this run because it is multi-gigabyte. Keep the exact matching CN recovery package together with the critical device-state backup.\n",
     )
     .map_err(|error| error.to_string())?;
 
@@ -354,7 +383,7 @@ fn flash_device_inner(
         erased_partitions,
         backup_records,
         warnings: vec![
-            "Slot B and all TB376FC low-level firmware were preserved.".to_string(),
+            "Slot B and all TB376FC low-level firmware were preserved, but shared super means slot B is not guaranteed bootable.".to_string(),
             "The first boot must remain unlocked; never relock.".to_string(),
         ],
     };
@@ -393,6 +422,27 @@ fn validate_preflight_report(report: &PreflightReport) -> CliResult<()> {
     ) {
         return Err("preflight current slot is not A".to_string());
     }
+    let expected_build_line = format!("build.display.id:{SOURCE_BUILD_DISPLAY_ID}");
+    if !report
+        .raw_getvar_all
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(&expected_build_line))
+    {
+        return Err(format!(
+            "preflight does not report the exact source build {SOURCE_BUILD_DISPLAY_ID}"
+        ));
+    }
+    for (location, source_index) in KNOWN_SOURCE_ROLLBACK_INDICES {
+        let baseline = report
+            .rollback_indices
+            .get(location)
+            .ok_or_else(|| format!("preflight is missing rollback location {location}"))?;
+        if baseline < source_index {
+            return Err(format!(
+                "preflight baseline {baseline} at location {location} is below running source index {source_index}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -400,14 +450,32 @@ fn validate_rollback_floors(
     report: &PreflightReport,
     analysis: &tb376::FirmwareAnalysis,
 ) -> CliResult<()> {
-    for image in &analysis.images {
-        let location = image.rollback_index_location;
-        if let Some(floor) = report.rollback_indices.get(&location)
-            && image.rollback_index < *floor
-        {
+    for (name, location, expected_index) in EXPECTED_TARGET_ROLLBACK_INDICES {
+        let image = analysis
+            .images
+            .iter()
+            .find(|image| image.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("target analysis is missing {name}"))?;
+        if image.rollback_index_location != 0 {
             return Err(format!(
-                "rollback refusal: {} index {} at location {} is below device floor {}",
-                image.name, image.rollback_index, location, floor
+                "{name} header rollback location is {}, expected 0; parent vbmeta assigns AVB location {location}",
+                image.rollback_index_location
+            ));
+        }
+        if image.rollback_index != *expected_index {
+            return Err(format!(
+                "unexpected target rollback index for {name}: {}; expected {} at AVB location {location}",
+                image.rollback_index, expected_index
+            ));
+        }
+        let floor = report
+            .rollback_indices
+            .get(location)
+            .ok_or_else(|| format!("preflight is missing rollback location {location}"))?;
+        if image.rollback_index < *floor {
+            return Err(format!(
+                "rollback refusal: {name} index {} at AVB location {location} is below conservative baseline {floor}",
+                image.rollback_index
             ));
         }
     }

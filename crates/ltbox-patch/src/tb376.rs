@@ -476,7 +476,7 @@ fn parse_supported_fdt(data: &[u8], bounds: FdtBounds) -> Result<Option<Supporte
                         pos
                     ))
                 })?;
-                pos = align4_checked(name_end + 1)
+                pos = align_fdt_offset(name_end + 1, bounds.base)
                     .ok_or_else(|| LtboxError::Patch("FDT node alignment overflow".to_string()))?;
                 if pos > bounds.struct_end {
                     return Err(LtboxError::Patch(
@@ -561,7 +561,7 @@ fn parse_supported_fdt(data: &[u8], bounds: FdtBounds) -> Result<Option<Supporte
                         root_region = Some((region, value_start));
                     }
                 }
-                pos = align4_checked(value_end).ok_or_else(|| {
+                pos = align_fdt_offset(value_end, bounds.base).ok_or_else(|| {
                     LtboxError::Patch("FDT property alignment overflow".to_string())
                 })?;
                 if pos > bounds.struct_end {
@@ -686,6 +686,11 @@ fn region_value(region: RegionTarget) -> [u8; 4] {
         RegionTarget::Prc => *b"PRC\0",
         RegionTarget::Row => *b"ROW\0",
     }
+}
+
+fn align_fdt_offset(value: usize, base: usize) -> Option<usize> {
+    let relative = value.checked_sub(base)?;
+    base.checked_add(align4_checked(relative)?)
 }
 
 fn align4_checked(value: usize) -> Option<usize> {

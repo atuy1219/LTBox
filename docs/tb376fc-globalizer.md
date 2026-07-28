@@ -39,17 +39,24 @@ tb376-globalizer prepare <TB390FU image folder> <prepared folder>
 tb376-globalizer plan <TB390FU image folder> <prepared folder> <plan.json>
 ```
 
-`analyze` checks the model fingerprint, ROW `product_region`, required images,
-AVB public-key SHA-1, image hashes and rollback metadata present in the package.
+`analyze` checks the model fingerprint, the supported root FDT
+`region,country` values, required images, AVB public-key SHA-1, image hashes and
+rollback metadata present in the package. It requires exactly three supported
+FDTs: two whose root `compatible` list contains `qcom,tuna` and one containing
+`qcom,tunap`. All three must report `ROW`.
 
 `prepare` creates:
 
-- `vendor_boot.img` with only the FDT `product_region` value changed from ROW to
-  PRC;
+- `vendor_boot.img` with only those three root FDT `region,country` values
+  changed from `ROW\0` to `PRC\0`; unrelated strings, including the AVB
+  fingerprint suffix, are left unchanged;
 - `vbmeta.img` with AVB flags
   `HASHTREE_DISABLED | VERIFICATION_DISABLED`;
 - `tb376fc-crossflash-manifest.json`;
 - `DO_NOT_RELOCK.txt`.
+
+The region patch requires exactly three replacements and exactly nine changed
+bytes, preserves the image size, and reparses the output before accepting it.
 
 `plan` parses `rawprogram*.xml`, but allows only these Android partitions:
 

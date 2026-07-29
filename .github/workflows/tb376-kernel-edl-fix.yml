@@ -101,3 +101,5 @@ jobs:
           - SHA-256: `${{ steps.stage.outputs.sha256 }}`
           - No WinUSB/Zadig driver replacement required
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+# Triggered after the workflow became visible on the branch.

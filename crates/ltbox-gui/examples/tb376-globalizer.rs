@@ -1,3 +1,4 @@
+use ltbox_device::driver::{QcomDriverMode, set_qcom_driver_mode};
 use ltbox_device::edl::{EdlSession, GptPartitionInfo};
 use ltbox_device::fastboot::FastbootDevice;
 use ltbox_patch::tb376;
@@ -62,6 +63,11 @@ struct FlashResult {
 }
 
 fn main() {
+    // The standalone CLI has no GUI settings bootstrap. Windows TB376FC
+    // uses Qualcomm's signed QDLoader serial driver, so force the qdl
+    // kernel/COM backend instead of the process default WinUSB backend.
+    #[cfg(windows)]
+    set_qcom_driver_mode(QcomDriverMode::Kernel);
     if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(1);

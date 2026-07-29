@@ -32,22 +32,17 @@ jobs:
           '@.Trim()
           if (-not $text.Contains($oldImport)) { throw 'EDL import anchor not found' }
           $text = $text.Replace($oldImport, $newImport)
-          $oldMain = @'
-          fn main() {
-              if let Err(error) = run() {
-          '@
-          $newMain = @'
+          $mainAnchor = 'fn main() {'
+          $mainReplacement = @'
           fn main() {
               // The standalone CLI has no GUI settings bootstrap. Windows TB376FC
               // uses Qualcomm's signed QDLoader serial driver, so force the qdl
               // kernel/COM backend instead of the process default WinUSB backend.
               #[cfg(windows)]
               set_qcom_driver_mode(QcomDriverMode::Kernel);
-
-              if let Err(error) = run() {
-          '@
-          if (-not $text.Contains($oldMain)) { throw 'main anchor not found' }
-          $text = $text.Replace($oldMain, $newMain)
+          '@.TrimEnd()
+          if (-not $text.Contains($mainAnchor)) { throw 'main anchor not found' }
+          $text = $text.Replace($mainAnchor, $mainReplacement)
           Set-Content $path $text -Encoding utf8NoBOM
 
       - name: Install Rust components

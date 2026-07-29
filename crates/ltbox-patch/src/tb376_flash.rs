@@ -11,6 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::tb376::{self, PROTECTED_PARTITIONS};
@@ -288,7 +289,21 @@ pub fn validate_programmer(loader: &Path) -> Result<String> {
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let digest = Sha256::digest(fs::read(path)?);
+    const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let digest = hasher.finalize();
     let mut output = String::with_capacity(64);
     for byte in digest {
         let _ = write!(&mut output, "{byte:02X}");

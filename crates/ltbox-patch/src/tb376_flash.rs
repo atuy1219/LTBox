@@ -104,9 +104,9 @@ pub fn build_flash_plan(firmware_dir: &Path, prepared_dir: &Path) -> Result<Flas
     }
 
     let modified_vendor_boot = prepared_dir.join("vendor_boot.img");
-    let modified_vbmeta = prepared_dir.join("vbmeta.img");
     require_file(&modified_vendor_boot)?;
-    require_file(&modified_vbmeta)?;
+    let official_vbmeta = firmware_dir.join("vbmeta.img");
+    require_file(&official_vbmeta)?;
 
     let rawprograms = rawprogram_paths(firmware_dir)?;
     let rawprogram_refs: Vec<&Path> = rawprograms.iter().map(PathBuf::as_path).collect();
@@ -170,11 +170,13 @@ pub fn build_flash_plan(firmware_dir: &Path, prepared_dir: &Path) -> Result<Flas
             )));
         }
 
-        let image = match base.as_str() {
-            "vendor_boot" => modified_vendor_boot.clone(),
-            "vbmeta" => modified_vbmeta.clone(),
-            _ => firmware_dir.join(record.filename.trim()),
-        };
+        let image = fixed_profile_image_path(
+            &base,
+            record.filename.trim(),
+            firmware_dir,
+            &modified_vendor_boot,
+            &official_vbmeta,
+        );
         require_file(&image)?;
         let image_size = fs::metadata(&image)?.len();
         if image_size == 0 {
@@ -374,6 +376,23 @@ fn flash_priority(base: &str) -> u8 {
     }
 }
 
+fn fixed_profile_image_path(
+    base: &str,
+    xml_filename: &str,
+    firmware_dir: &Path,
+    modified_vendor_boot: &Path,
+    official_vbmeta: &Path,
+) -> PathBuf {
+    match base {
+        "vendor_boot" => modified_vendor_boot.to_path_buf(),
+        // Hardware testing proved that flags=3, signature-damaged and
+        // unsigned vbmeta variants make the slot unbootable. The fixed
+        // TB376FC profile must use the ROM's official ROW vbmeta verbatim.
+        "vbmeta" => official_vbmeta.to_path_buf(),
+        _ => firmware_dir.join(xml_filename),
+    }
+}
+
 fn require_file(path: &Path) -> Result<()> {
     if !path.is_file() {
         return Err(LtboxError::FileNotFound(path.display().to_string()));
@@ -401,8 +420,36 @@ mod tests {
     }
 
     #[test]
-    fn top_level_vbmeta_is_flashed_last() {
+    fn official_top_level_vbmeta_is_flashed_last() {
         assert!(flash_priority("vbmeta") > flash_priority("vendor_boot"));
         assert!(flash_priority("vendor_boot") > flash_priority("super"));
+    }
+
+    #[test]
+    fn tb376_profile_never_takes_vbmeta_from_prepared_dir() {
+        let firmware = Path::new("rom");
+        let prepared = Path::new("prepared");
+        let official = firmware.join("vbmeta.img");
+        let patched_vendor_boot = prepared.join("vendor_boot.img");
+        assert_eq!(
+            fixed_profile_image_path(
+                "vbmeta",
+                "vbmeta.img",
+                firmware,
+                &patched_vendor_boot,
+                &official,
+            ),
+            Path::new("rom/vbmeta.img")
+        );
+        assert_eq!(
+            fixed_profile_image_path(
+                "vendor_boot",
+                "vendor_boot.img",
+                firmware,
+                &patched_vendor_boot,
+                &official,
+            ),
+            Path::new("prepared/vendor_boot.img")
+        );
     }
 }

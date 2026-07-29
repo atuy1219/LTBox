@@ -50,10 +50,11 @@ FDTs: two whose root `compatible` list contains `qcom,tuna` and one containing
 - `vendor_boot.img` with only those three root FDT `region,country` values
   changed from `ROW\0` to `PRC\0`; unrelated strings, including the AVB
   fingerprint suffix, are left unchanged;
-- `vbmeta.img` with AVB flags
-  `HASHTREE_DISABLED | VERIFICATION_DISABLED`;
 - `tb376fc-crossflash-manifest.json`;
 - `DO_NOT_RELOCK.txt`.
+
+It does **not** create or modify `vbmeta.img`. The flash plan uses the official
+ROW `vbmeta.img` directly from the ROM directory.
 
 The region patch requires exactly three replacements and exactly nine changed
 bytes, preserves the image size, and reparses the output before accepting it.
@@ -118,8 +119,8 @@ The flasher performs these steps:
 4. Opens Sahara/Firehose and scans GPT on UFS LUNs 0–5.
 5. Checks every XML write range is contained inside the exact device partition.
 6. Backs up all small target partitions and `metadata` before writing.
-7. Writes `super` first, boot-chain Android images next and top-level `vbmeta`
-   last.
+7. Writes `super` first, boot-chain Android images next and the official,
+   byte-for-byte unmodified ROW `vbmeta` last.
 8. Performs full read-back verification for normal images and head/tail sampling
    for split `super` chunks.
 9. Erases `metadata` and `userdata` while preserving FRP.
@@ -149,14 +150,23 @@ The allowlist also excludes ABL, XBL, TZ, modem, Bluetooth/DSP firmware and all
 other low-level TB376FC firmware. The CN hardware boot chain and hardware region
 remain intact.
 
-## AVB model
+## Verified AVB configuration
 
-TB376FC/TB390FU use Lenovo's fixed AVB key, whose private key is unavailable.
-The tool therefore does not substitute LTBox's AOSP test key. It relies on the
-officially unlocked bootloader and applies the same top-level vbmeta flag field
-used by Fastboot's disable-verification/disable-verity path.
+Hardware testing established one bootable configuration:
 
-The modified `vendor_boot.img` and `vbmeta.img` are not validly signed by Lenovo.
-They must never be installed on a locked device.
+```text
+vendor_boot_a  ROW image with exactly three root region,country values patched to PRC
+vbmeta_a       official ROW image from the same target build, completely unmodified
+```
+
+Changing official ROW vbmeta flags from 0 to 3, damaging its signature, or
+generating an unsigned algorithm-NONE vbmeta made the slot immediately
+unbootable (`slot-unbootable: yes`, `slot-successful: no`). Consequently the
+TB376FC flow never changes vbmeta flags, never creates unsigned vbmeta, and
+never takes vbmeta from the prepared directory. Generic LTBox AVB tooling used
+by other device flows is unaffected.
+
+The modified `vendor_boot.img` is only supported with an officially unlocked
+bootloader. The bootloader must never be relocked.
 
 **Never relock after installing modified or cross-model firmware images.**

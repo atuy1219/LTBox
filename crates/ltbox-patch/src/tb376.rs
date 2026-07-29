@@ -1,15 +1,14 @@
 //! TB376FC -> TB390FU cross-flash analysis and offline image preparation.
 //!
 //! This module never flashes a device. It validates one fixed profile and
-//! prepares two images for an officially bootloader-unlocked TB376FC:
+//! prepares one image for an officially bootloader-unlocked TB376FC:
 //!
 //! - `vendor_boot.img`: only the root FDT `region,country` properties for the
 //!   supported Tuna boards are changed from ROW to PRC.
-//! - `vbmeta.img`: AVB verification and hashtree-disable flags are enabled in
-//!   the same header field used by fastboot's disable-verification operation.
 //!
-//! Both edits invalidate Lenovo's original signatures. Never use the outputs
-//! on a locked bootloader and never relock after installing them.
+//! The fixed profile deliberately leaves Lenovo's official ROW `vbmeta.img`
+//! byte-for-byte unchanged. Hardware testing showed that modified, unsigned,
+//! and flags=3 vbmeta images all make the target slot unbootable.
 
 use fs_err as fs;
 use ltbox_core::{LtboxError, Result};
@@ -48,12 +47,6 @@ const REQUIRED_IMAGES: &[&str] = &[
     "boot.img",
 ];
 const OPTIONAL_IMAGES: &[&str] = &["init_boot.img", "dtbo.img", "recovery.img"];
-
-const AVB_HEADER_SIZE: usize = 256;
-const AVB_FLAGS_OFFSET: usize = 120;
-const AVB_MAGIC: &[u8; 4] = b"AVB0";
-const AVB_HASHTREE_DISABLED: u32 = 1;
-const AVB_VERIFICATION_DISABLED: u32 = 2;
 
 const FDT_MAGIC: u32 = 0xD00D_FEED;
 const FDT_MAGIC_BYTES: [u8; 4] = [0xD0, 0x0D, 0xFE, 0xED];
@@ -112,15 +105,10 @@ pub struct PreparationManifest {
     pub output_dir: String,
     pub analysis: FirmwareAnalysis,
     pub outputs: Vec<PreparedImage>,
-    pub vbmeta_old_flags: u32,
-    pub vbmeta_new_flags: u32,
+    pub official_vbmeta_path: String,
+    pub official_vbmeta_sha256: String,
+    pub official_vbmeta_modified: bool,
     pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VbmetaFlagPatch {
-    pub old_flags: u32,
-    pub new_flags: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,30 +231,15 @@ pub fn prepare_tb376_crossflash_images(
         RegionTarget::Prc,
     )?;
 
-    let vbmeta_out = output_dir.join("vbmeta.img");
-    let vbmeta_patch = patch_top_level_vbmeta_flags(
-        &firmware_dir.join("vbmeta.img"),
-        &vbmeta_out,
-        AVB_HASHTREE_DISABLED | AVB_VERIFICATION_DISABLED,
-    )?;
-
-    let outputs = vec![
-        prepared_image(
-            "vendor_boot.img",
-            &vendor_boot_out,
-            format!(
-                "patched {replacements} supported root region,country value(s) ROW -> PRC; the retained Lenovo AVB footer is stale after the payload edit"
-            ),
-        )?,
-        prepared_image(
-            "vbmeta.img",
-            &vbmeta_out,
-            format!(
-                "set top-level AVB flags {} -> {}; this intentionally invalidates the original Lenovo signature",
-                vbmeta_patch.old_flags, vbmeta_patch.new_flags
-            ),
-        )?,
-    ];
+    let official_vbmeta = firmware_dir.join("vbmeta.img");
+    let official_vbmeta_sha256 = sha256_file(&official_vbmeta)?;
+    let outputs = vec![prepared_image(
+        "vendor_boot.img",
+        &vendor_boot_out,
+        format!(
+            "patched {replacements} supported root region,country value(s) ROW -> PRC; official ROW vbmeta remains unmodified"
+        ),
+    )?];
 
     let manifest = PreparationManifest {
         profile: PROFILE_NAME.to_string(),
@@ -274,11 +247,13 @@ pub fn prepare_tb376_crossflash_images(
         output_dir: output_dir.display().to_string(),
         analysis,
         outputs,
-        vbmeta_old_flags: vbmeta_patch.old_flags,
-        vbmeta_new_flags: vbmeta_patch.new_flags,
+        official_vbmeta_path: official_vbmeta.display().to_string(),
+        official_vbmeta_sha256,
+        official_vbmeta_modified: false,
         warnings: vec![
             "PREPARATION ONLY: no device was flashed.".to_string(),
-            "Both images require an unlocked bootloader; never relock after installing them.".to_string(),
+            "Use only the PRC-patched vendor_boot with the official, unmodified ROW vbmeta from the ROM directory.".to_string(),
+            "Never set vbmeta flags, generate unsigned vbmeta, or flash a prepared-directory vbmeta for this profile.".to_string(),
             "The guarded flash path requires a fresh exact-build preflight and validates all four AVB rollback locations.".to_string(),
         ],
     };
@@ -351,31 +326,6 @@ pub fn patch_vendor_boot_region_country(
     fs::write(output, patched)?;
     ensure_same_size(input, output, "vendor_boot region patch")?;
     Ok(fdts.len())
-}
-
-pub fn patch_top_level_vbmeta_flags(
-    input: &Path,
-    output: &Path,
-    flags_to_enable: u32,
-) -> Result<VbmetaFlagPatch> {
-    require_file(input)?;
-    let mut data = fs::read(input)?;
-    if data.len() < AVB_HEADER_SIZE || &data[..4] != AVB_MAGIC {
-        return Err(LtboxError::Avb(format!(
-            "{} is not a top-level AVB vbmeta image",
-            input.display()
-        )));
-    }
-
-    let old_flags = be32(&data[AVB_FLAGS_OFFSET..AVB_FLAGS_OFFSET + 4]);
-    let new_flags = old_flags | flags_to_enable;
-    data[AVB_FLAGS_OFFSET..AVB_FLAGS_OFFSET + 4].copy_from_slice(&new_flags.to_be_bytes());
-    fs::write(output, data)?;
-    ensure_same_size(input, output, "vbmeta flag patch")?;
-    Ok(VbmetaFlagPatch {
-        old_flags,
-        new_flags,
-    })
 }
 
 fn validate_supported_fdt_set(data: &[u8]) -> Result<(RegionTarget, Vec<SupportedFdt>)> {
@@ -720,33 +670,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn patches_vbmeta_flags_without_changing_size() {
-        let tmp = tempfile::tempdir().unwrap();
-        let input = tmp.path().join("vbmeta.img");
-        let output = tmp.path().join("vbmeta-patched.img");
-        let mut data = vec![0u8; 4096];
-        data[..4].copy_from_slice(AVB_MAGIC);
-        data[AVB_FLAGS_OFFSET..AVB_FLAGS_OFFSET + 4].copy_from_slice(&4u32.to_be_bytes());
-        fs::write(&input, &data).unwrap();
-
-        let result = patch_top_level_vbmeta_flags(&input, &output, 3).unwrap();
-        assert_eq!(result.old_flags, 4);
-        assert_eq!(result.new_flags, 7);
-        let patched = fs::read(output).unwrap();
-        assert_eq!(patched.len(), data.len());
-        assert_eq!(be32(&patched[AVB_FLAGS_OFFSET..AVB_FLAGS_OFFSET + 4]), 7);
-    }
-
-    #[test]
-    fn rejects_non_vbmeta_input() {
-        let tmp = tempfile::tempdir().unwrap();
-        let input = tmp.path().join("not-vbmeta.img");
-        let output = tmp.path().join("out.img");
-        fs::write(&input, vec![0u8; AVB_HEADER_SIZE]).unwrap();
-        assert!(patch_top_level_vbmeta_flags(&input, &output, 3).is_err());
-    }
 
     #[test]
     fn detects_fixed_row_fdt_set_with_unrelated_fdt() {

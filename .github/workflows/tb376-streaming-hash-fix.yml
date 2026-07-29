@@ -124,3 +124,5 @@ jobs:
           - Kernel/COM EDL backend retained
           - Executable SHA-256: `${{ steps.stage.outputs.sha256 }}`
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+# Triggered after workflow registration.

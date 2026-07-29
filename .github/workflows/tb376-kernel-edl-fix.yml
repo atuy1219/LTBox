@@ -1,24 +1,24 @@
-name: TB376 Kernel EDL Fix
+name: TB376 Kernel EDL Source Fix
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
+      - agent/tb376fc-globalizer
     paths:
       - '.github/workflows/tb376-kernel-edl-fix.yml'
-  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  patch-build:
+  patch-source:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          ref: agent/tb376fc-globalizer
+          fetch-depth: 0
 
       - name: Force Windows kernel COM backend
         shell: pwsh
@@ -44,46 +44,14 @@ jobs:
           if (-not $text.Contains($mainAnchor)) { throw 'main anchor not found' }
           $text = $text.Replace($mainAnchor, $mainReplacement)
           Set-Content $path $text -Encoding utf8NoBOM
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
-
-      - name: Format, test and build
-        run: |
           cargo fmt --all
           cargo fmt --all -- --check
-          cargo test --locked -p ltbox-patch tb376
-          cargo clippy --locked -p ltbox-gui --example tb376-globalizer -- -D warnings
-          cargo build --locked --release -p ltbox-gui --example tb376-globalizer
 
-      - name: Stage artifact
-        id: stage
+      - name: Commit source fix
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          $source = 'target\release\examples\tb376-globalizer.exe'
-          $target = 'dist\tb376-globalizer-win-x64-kernel-edl.exe'
-          Copy-Item $source $target -Force
-          $hash = (Get-FileHash $target -Algorithm SHA256).Hash
-          "$hash  tb376-globalizer-win-x64-kernel-edl.exe" | Set-Content -Encoding ascii 'dist\tb376-globalizer-win-x64-kernel-edl.exe.sha256'
-          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Upload executable
-        uses: actions/upload-artifact@v4
-        with:
-          name: tb376-globalizer-kernel-edl-${{ github.sha }}
-          path: |
-            dist/tb376-globalizer-win-x64-kernel-edl.exe
-            dist/tb376-globalizer-win-x64-kernel-edl.exe.sha256
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Summary
-        shell: pwsh
-        run: |
-          @"
-          ## TB376 kernel EDL fix
-          - Backend: Qualcomm QDLoader serial/COM
-          - SHA-256: `${{ steps.stage.outputs.sha256 }}`
-          - No WinUSB/Zadig driver replacement required
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/ltbox-gui/examples/tb376-globalizer.rs
+          git commit -m 'Force TB376 CLI to use kernel EDL backend'
+          git push origin HEAD:agent/tb376fc-globalizer

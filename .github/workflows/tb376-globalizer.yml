@@ -1,0 +1,96 @@
+name: TB376FC Globalizer
+
+on:
+  push:
+    branches:
+      - agent/tb376fc-globalizer
+    paths:
+      - '.github/workflows/tb376-globalizer.yml'
+      - 'crates/ltbox-core/**'
+      - 'crates/ltbox-device/**'
+      - 'crates/ltbox-patch/**'
+      - 'crates/ltbox-gui/examples/tb376-globalizer.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/tb376-globalizer.yml'
+      - 'crates/ltbox-core/**'
+      - 'crates/ltbox-device/**'
+      - 'crates/ltbox-patch/**'
+      - 'crates/ltbox-gui/examples/tb376-globalizer.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: TB376 unit tests
+        run: cargo test --locked -p ltbox-patch tb376
+
+      - name: Build release CLI
+        run: cargo build --locked --release -p ltbox-gui --example tb376-globalizer
+
+      - name: Stage artifact
+        id: stage
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $source = Join-Path $PWD 'target\release\examples\tb376-globalizer.exe'
+          $target = Join-Path $dist 'tb376-globalizer-win-x64.exe'
+          Copy-Item $source $target -Force
+          $hash = (Get-FileHash $target -Algorithm SHA256).Hash
+          "$hash  tb376-globalizer-win-x64.exe" | Set-Content -Encoding ascii (Join-Path $dist 'tb376-globalizer-win-x64.exe.sha256')
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: tb376-globalizer-win-x64-${{ github.sha }}
+          path: |
+            dist/tb376-globalizer-win-x64.exe
+            dist/tb376-globalizer-win-x64.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          @"
+          ## TB376FC Globalizer
+
+          - Target: Windows x64
+          - SHA-256: `${{ steps.stage.outputs.sha256 }}`
+          - Flash profile: TB376FC → TB390FU 18.0.10.335
+          - Bootloader must be officially unlocked
+          - Never relock after cross-flashing
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
